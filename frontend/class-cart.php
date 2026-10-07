@@ -708,33 +708,73 @@ class Cart {
      * @return string Stable fee key.
      */
     private function build_product_fee_group_key( $calc_data, $product_id ) {
-        $selections = isset( $calc_data['selections'] ) && is_array( $calc_data['selections'] )
-            ? $calc_data['selections']
-            : array();
-        $display_data = isset( $calc_data['display_data'] ) && is_array( $calc_data['display_data'] )
+        $calculator_id = isset( $calc_data['calculator_id'] ) ? absint( $calc_data['calculator_id'] ) : 0;
+        $display_data  = isset( $calc_data['display_data'] ) && is_array( $calc_data['display_data'] )
             ? $calc_data['display_data']
             : array();
 
-        foreach ( $display_data as $field_id => $field_data ) {
-            if ( ! is_array( $field_data ) ) {
-                continue;
-            }
+        $config = array();
 
-            if ( isset( $field_data['type'] ) && 'quantity' === $field_data['type'] && isset( $selections[ $field_id ] ) ) {
-                unset( $selections[ $field_id ] );
+        if ( ! empty( $display_data ) ) {
+            // Preferred source: display_data only holds fields that were visible
+            // (show_when applied), so stale values of hidden fields do not split
+            // otherwise identical configurations.
+            foreach ( $display_data as $field_id => $field_data ) {
+                if ( ! is_array( $field_data ) || 'quantity' === ( $field_data['type'] ?? '' ) ) {
+                    continue;
+                }
+
+                $config[ $field_id ] = $field_data['raw_value'] ?? ( $field_data['value'] ?? '' );
+            }
+        } elseif ( isset( $calc_data['selections'] ) && is_array( $calc_data['selections'] ) ) {
+            // Fallback for cart items without display data: use the raw selections,
+            // minus any quantity fields as defined by the calculator.
+            $config = $calc_data['selections'];
+
+            foreach ( $this->get_quantity_field_ids( $calculator_id ) as $quantity_field_id ) {
+                unset( $config[ $quantity_field_id ] );
             }
         }
 
-        ksort( $selections );
+        ksort( $config );
 
         $key_data = array(
-            'calculator_id' => isset( $calc_data['calculator_id'] ) ? absint( $calc_data['calculator_id'] ) : 0,
+            'calculator_id' => $calculator_id,
             'product_id'    => absint( $product_id ),
-            'selections'    => $selections,
+            'config'        => $config,
             'product_fee'   => floatval( $calc_data['product_fee'] ?? 0 ),
         );
 
         return 'bossier_product_fee_' . md5( wp_json_encode( $key_data ) );
+    }
+
+    /**
+     * Get the IDs of quantity-type fields for a calculator.
+     *
+     * @param int $calculator_id Calculator ID.
+     * @return array Field IDs.
+     */
+    private function get_quantity_field_ids( $calculator_id ) {
+        static $cache = array();
+
+        if ( ! $calculator_id ) {
+            return array();
+        }
+
+        if ( ! isset( $cache[ $calculator_id ] ) ) {
+            $cache[ $calculator_id ] = array();
+            $calculator              = new Calculator( $calculator_id );
+
+            if ( $calculator->is_valid() ) {
+                foreach ( (array) $calculator->get_enabled_fields() as $field_id => $field ) {
+                    if ( is_array( $field ) && 'quantity' === ( $field['type'] ?? '' ) ) {
+                        $cache[ $calculator_id ][] = $field_id;
+                    }
+                }
+            }
+        }
+
+        return $cache[ $calculator_id ];
     }
 
     /**

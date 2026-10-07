@@ -48,9 +48,13 @@ namespace {
 
 namespace Bossier\Calculator {
     class Calculator {
-        public function __construct( $id = 0 ) {}
-        public function is_valid() { return false; }
+        /** @var array<int,array> Registry of fields per calculator id for tests. */
+        public static $registry = array();
+        private $id;
+        public function __construct( $id = 0 ) { $this->id = $id; }
+        public function is_valid() { return isset( self::$registry[ $this->id ] ); }
         public function get_settings() { return array(); }
+        public function get_enabled_fields() { return self::$registry[ $this->id ] ?? array(); }
     }
 }
 
@@ -170,6 +174,151 @@ namespace {
         false !== strpos( $names[0], '100' ) && false !== strpos( $names[1], '101' ),
         implode( ' | ', $names )
     );
+
+    // ---------------------------------------------------------------------
+    // Hardening: products without dimensions / unusual data.
+    // ---------------------------------------------------------------------
+
+    \Bossier\Calculator\Calculator::$registry[7] = array(
+        'fcolor' => array( 'type' => 'color' ),
+        'fqty'   => array( 'type' => 'quantity' ),
+    );
+
+    /**
+     * Build a calculator item without any dimension fields.
+     */
+    function make_item_no_dims( $product_id, $color, $qty, $name = 'Paalmuts' ) {
+        return array(
+            'data'               => new Fake_Product( $name ),
+            'product_id'         => $product_id,
+            'quantity'           => $qty,
+            'bossier_calculator' => array(
+                'calculator_id'     => 7,
+                'product_id'        => $product_id,
+                'selections'        => array( 'fcolor' => $color, 'fqty' => $qty ),
+                'display_data'      => array(
+                    'fcolor' => array( 'label' => 'Kleur', 'value' => $color, 'raw_value' => $color, 'type' => 'color' ),
+                    'fqty'   => array( 'label' => 'Aantal', 'value' => (string) $qty, 'raw_value' => $qty, 'type' => 'quantity' ),
+                ),
+                'product_fee'       => 150.0,
+                'product_fee_label' => 'Eenmalige malkosten',
+            ),
+        );
+    }
+
+    // 10. No dimensions, same option: charged once.
+    $fees = run_fees( array(
+        'k1' => make_item_no_dims( 10, 'Grijs', 1 ),
+        'k2' => make_item_no_dims( 10, 'Grijs', 4 ),
+    ) );
+    check( 'No dimensions, same option, different quantity: charged once', 1 === count( $fees ), 'fees: ' . count( $fees ) );
+
+    // 11. No dimensions, different option: charged twice with distinct names.
+    $fees = run_fees( array(
+        'k1' => make_item_no_dims( 10, 'Grijs', 1 ),
+        'k2' => make_item_no_dims( 10, 'Antraciet', 1 ),
+    ) );
+    check( 'No dimensions, different option: charged twice', 2 === count( $fees ), 'fees: ' . count( $fees ) );
+    $names = array_column( $fees, 'name' );
+    check(
+        'No-dimension fee names show the option instead of an empty suffix',
+        false === strpos( implode( '|', $names ), '()' ) && false !== strpos( implode( '|', $names ), 'Antraciet' ),
+        implode( ' | ', $names )
+    );
+
+    // 12. No dimensions and no options at all: same product charged once.
+    $bare = function ( $product_id, $qty, $name = 'Paalmuts' ) {
+        return array(
+            'data'               => new Fake_Product( $name ),
+            'product_id'         => $product_id,
+            'quantity'           => $qty,
+            'bossier_calculator' => array(
+                'calculator_id'     => 7,
+                'product_id'        => $product_id,
+                'selections'        => array(),
+                'display_data'      => array(),
+                'product_fee'       => 150.0,
+                'product_fee_label' => 'Eenmalige malkosten',
+            ),
+        );
+    };
+    $fees = run_fees( array( 'k1' => $bare( 10, 1 ), 'k2' => $bare( 10, 3 ) ) );
+    check( 'No dimensions and no options: same product charged once', 1 === count( $fees ), 'fees: ' . count( $fees ) );
+
+    // 13. Two different products that share a name must both be charged (no ID collision).
+    $fees = run_fees( array( 'k1' => $bare( 10, 1, 'Paalmuts' ), 'k2' => $bare( 11, 1, 'Paalmuts' ) ) );
+    check( 'Different products with identical names are both charged', 2 === count( $fees ), 'fees: ' . count( $fees ) );
+
+    // 14. Empty product name does not break or produce a dangling separator.
+    $fees  = run_fees( array( 'k1' => $bare( 10, 1, '' ) ) );
+    $names = array_column( $fees, 'name' );
+    check(
+        'Empty product name gives a clean fee name',
+        1 === count( $fees ) && 'Eenmalige malkosten' === $names[0],
+        implode( ' | ', $names )
+    );
+
+    // 15. Missing display_data and selections keys (old cart items): no warnings, one fee.
+    $legacy = function ( $qty ) {
+        return array(
+            'data'               => new Fake_Product( 'Paalmuts' ),
+            'product_id'         => 10,
+            'quantity'           => $qty,
+            'bossier_calculator' => array(
+                'calculator_id'     => 7,
+                'product_fee'       => 150.0,
+                'product_fee_label' => 'Eenmalige malkosten',
+            ),
+        );
+    };
+    $fees = run_fees( array( 'k1' => $legacy( 1 ), 'k2' => $legacy( 2 ) ) );
+    check( 'Legacy cart items without display data are charged once', 1 === count( $fees ), 'fees: ' . count( $fees ) );
+
+    // 16. display_data missing, but selections include a quantity: quantity must not split the fee.
+    $no_display = function ( $qty ) {
+        return array(
+            'data'               => new Fake_Product( 'Paalmuts' ),
+            'product_id'         => 10,
+            'quantity'           => $qty,
+            'bossier_calculator' => array(
+                'calculator_id'     => 7,
+                'product_id'        => 10,
+                'selections'        => array( 'fcolor' => 'Grijs', 'fqty' => $qty ),
+                'product_fee'       => 150.0,
+                'product_fee_label' => 'Eenmalige malkosten',
+            ),
+        );
+    };
+    $fees = run_fees( array( 'k1' => $no_display( 1 ), 'k2' => $no_display( 6 ) ) );
+    check( 'Quantity in selections does not split the fee when display data is missing', 1 === count( $fees ), 'fees: ' . count( $fees ) );
+
+    // 17. Stale value of a hidden (show_when) field must not split identical visible configurations.
+    $with_hidden = function ( $hidden_value ) {
+        $item = make_item_no_dims( 10, 'Grijs', 1 );
+        $item['bossier_calculator']['selections']['fhidden'] = $hidden_value; // Not in display_data.
+        return $item;
+    };
+    $fees = run_fees( array( 'k1' => $with_hidden( 'a' ), 'k2' => $with_hidden( 'b' ) ) );
+    check( 'Hidden-field leftovers do not create an extra fee', 1 === count( $fees ), 'fees: ' . count( $fees ) );
+
+    // 18. Non-scalar / malformed display values must not crash.
+    $odd = make_item_no_dims( 10, 'Grijs', 1 );
+    $odd['bossier_calculator']['display_data']['fodd']  = array( 'label' => 'Odd', 'value' => array( 'x' ), 'raw_value' => array( 'x' ), 'type' => 'custom' );
+    $odd['bossier_calculator']['display_data']['fbad']  = 'not-an-array';
+    $odd['bossier_calculator']['display_data']['fhtml'] = array( 'label' => 'Html', 'value' => '<b>Vet</b>', 'raw_value' => 'Vet', 'type' => 'text' );
+    $fees  = run_fees( array( 'k1' => $odd ) );
+    $names = array_column( $fees, 'name' );
+    check( 'Malformed display data does not crash and strips markup from the name', 1 === count( $fees ) && false === strpos( $names[0], '<' ), implode( ' | ', $names ) );
+
+    // 19. Cart item with a missing product object does not crash.
+    $nodata         = make_item_no_dims( 10, 'Grijs', 1 );
+    $nodata['data'] = null;
+    $fees           = run_fees( array( 'k1' => $nodata ) );
+    check( 'Missing product object does not crash', 1 === count( $fees ), 'fees: ' . count( $fees ) );
+
+    // 20. Non-calculator items in the cart are ignored.
+    $fees = run_fees( array( 'k1' => array( 'data' => new Fake_Product( 'Plain' ), 'quantity' => 1 ) ) );
+    check( 'Non-calculator cart items are ignored', 0 === count( $fees ), 'fees: ' . count( $fees ) );
 
     echo "\n$pass passed, $fail failed.\n";
     exit( $fail > 0 ? 1 : 0 );
