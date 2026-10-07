@@ -60,6 +60,14 @@ check(
 );
 
 check(
+    'Product fee names are made unique per configuration so WooCommerce does not reject duplicate fee IDs',
+    false !== strpos( $cart_php, 'private function build_unique_product_fee_name' )
+        && false !== strpos( $cart_php, 'private function build_product_fee_group_key' )
+        && false !== strpos( $cart_php, '$this->build_unique_product_fee_name( $fee_data, $used_fee_ids )' ),
+    'Behavior is covered by tests/test-product-fee-grouping.php; WC fee ID is sanitize_title( name ).'
+);
+
+check(
     'Cart total recalculation sets calculator price in WooCommerce tax input mode',
     false !== strpos( $cart_php, 'private function get_woocommerce_price( $inclusive_price )' )
         && false !== strpos( $cart_php, 'private function should_set_inclusive_price()' )

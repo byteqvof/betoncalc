@@ -696,12 +696,54 @@ class Cart {
     }
 
     /**
+     * Build a stable fee key for a calculator configuration.
+     *
+     * This keeps identical product configurations grouped into a single
+     * product fee, while still charging separately when the dimensions or
+     * selection values change. The quantity field is ignored because a fee is
+     * one-time per configuration, not per item count.
+     *
+     * @param array $calc_data Cart calculator data.
+     * @param int   $product_id Product ID.
+     * @return string Stable fee key.
+     */
+    private function build_product_fee_group_key( $calc_data, $product_id ) {
+        $selections = isset( $calc_data['selections'] ) && is_array( $calc_data['selections'] )
+            ? $calc_data['selections']
+            : array();
+        $display_data = isset( $calc_data['display_data'] ) && is_array( $calc_data['display_data'] )
+            ? $calc_data['display_data']
+            : array();
+
+        foreach ( $display_data as $field_id => $field_data ) {
+            if ( ! is_array( $field_data ) ) {
+                continue;
+            }
+
+            if ( isset( $field_data['type'] ) && 'quantity' === $field_data['type'] && isset( $selections[ $field_id ] ) ) {
+                unset( $selections[ $field_id ] );
+            }
+        }
+
+        ksort( $selections );
+
+        $key_data = array(
+            'calculator_id' => isset( $calc_data['calculator_id'] ) ? absint( $calc_data['calculator_id'] ) : 0,
+            'product_id'    => absint( $product_id ),
+            'selections'    => $selections,
+            'product_fee'   => floatval( $calc_data['product_fee'] ?? 0 ),
+        );
+
+        return 'bossier_product_fee_' . md5( wp_json_encode( $key_data ) );
+    }
+
+    /**
      * Add one-time product fees to cart.
      * Each unique cart item (configuration) with a product fee gets the fee added ONCE,
      * regardless of quantity.
      *
-     * IMPORTANT: This fee is charged once per CART ITEM KEY (unique configuration),
-     * not per quantity unit. This ensures:
+     * IMPORTANT: This fee is charged once per product configuration, not per quantity unit.
+     * This ensures:
      * - Quantity changes don't affect the fee (qty 1 or qty 10 = same fee)
      * - Same product with different configurations = separate fees
      * - Same product with same configuration = one fee
@@ -716,9 +758,8 @@ class Cart {
             return;
         }
 
-        // Track fees by cart_item_key to ensure one fee per unique configuration
-        // This prevents duplication when quantity changes, but allows different
-        // configurations of the same product to each have their own fee.
+        // Track fees by configuration hash so identical products are charged once,
+        // while different dimensions/options still receive separate fees.
         $cart_item_fees = array();
 
         foreach ( $cart->get_cart() as $cart_item_key => $cart_item ) {
@@ -763,27 +804,111 @@ class Cart {
                     $fee_label = __( 'Eenmalige productkosten', 'bossier-calculator' );
                 }
 
-                // Create a unique fee name per cart item
-                if ( ! empty( $product_name ) ) {
-                    $fee_name = sprintf( '%s - %s', $fee_label, $product_name );
-                } else {
-                    $fee_name = $fee_label;
-                }
+                $fee_key = $this->build_product_fee_group_key( $calc_data, $product_id );
 
-                // Store fee info - use cart_item_key as unique identifier
-                $cart_item_fees[ $cart_item_key . '_product_fee' ] = array(
-                    'name'   => $fee_name,
-                    'amount' => $product_fee,
+                // Identical configurations share one fee key, so they are only stored once.
+                $cart_item_fees[ $fee_key ] = array(
+                    'label'        => $fee_label,
+                    'product_name' => $product_name,
+                    'calc_data'    => $calc_data,
+                    'amount'       => $product_fee,
                 );
             }
         }
 
-        // Add all collected fees (one per unique cart item configuration)
+        // Add all collected fees (one per unique product configuration)
         // Fee amounts are entered incl. BTW, so we convert to excl. and let WooCommerce add tax.
+        //
+        // WooCommerce derives the fee ID from sanitize_title( name ) and silently
+        // rejects a fee whose ID already exists. The name must therefore be unique
+        // per configuration, otherwise only the first fee would be charged.
+        $used_fee_ids = array();
+
         foreach ( $cart_item_fees as $fee_key => $fee_data ) {
+            $fee_name         = $this->build_unique_product_fee_name( $fee_data, $used_fee_ids );
             $exclusive_amount = $this->get_exclusive_price( $fee_data['amount'] );
-            $cart->add_fee( $fee_data['name'], $exclusive_amount, true, '' );
+            $cart->add_fee( $fee_name, $exclusive_amount, true, '' );
         }
+    }
+
+    /**
+     * Build a fee name that is unique per configuration.
+     *
+     * Tries, in order: label + product + dimensions, label + product + all
+     * selected options, and finally a numeric suffix. The chosen name's
+     * sanitized form is recorded in $used_fee_ids to match WooCommerce's fee ID.
+     *
+     * @param array $fee_data     Fee data (label, product_name, calc_data).
+     * @param array $used_fee_ids Sanitized fee names already used (by reference).
+     * @return string Unique fee name.
+     */
+    private function build_unique_product_fee_name( $fee_data, &$used_fee_ids ) {
+        $base = $fee_data['label'];
+        if ( ! empty( $fee_data['product_name'] ) ) {
+            $base = sprintf( '%s - %s', $base, $fee_data['product_name'] );
+        }
+
+        $candidates = array();
+        foreach ( array( false, true ) as $include_all ) {
+            $summary = $this->get_product_fee_config_summary( $fee_data['calc_data'], $include_all );
+            if ( '' !== $summary ) {
+                $candidates[] = sprintf( '%s (%s)', $base, $summary );
+            }
+        }
+        $candidates[] = $base;
+
+        foreach ( $candidates as $candidate ) {
+            $id = sanitize_title( $candidate );
+            if ( ! isset( $used_fee_ids[ $id ] ) ) {
+                $used_fee_ids[ $id ] = true;
+                return $candidate;
+            }
+        }
+
+        $last   = end( $candidates );
+        $suffix = 2;
+        do {
+            $candidate = sprintf( '%s #%d', $last, $suffix );
+            $id        = sanitize_title( $candidate );
+            $suffix++;
+        } while ( isset( $used_fee_ids[ $id ] ) );
+
+        $used_fee_ids[ $id ] = true;
+        return $candidate;
+    }
+
+    /**
+     * Summarize a calculator configuration for use in a fee name.
+     *
+     * The quantity field is always excluded because it does not affect the fee.
+     *
+     * @param array $calc_data   Cart calculator data.
+     * @param bool  $include_all Include every selected option, not only dimensions.
+     * @return string Summary, e.g. "350 mm x 350 mm x 50 mm".
+     */
+    private function get_product_fee_config_summary( $calc_data, $include_all ) {
+        $display_data = isset( $calc_data['display_data'] ) && is_array( $calc_data['display_data'] )
+            ? $calc_data['display_data']
+            : array();
+
+        $parts = array();
+        foreach ( $display_data as $field_data ) {
+            if ( ! is_array( $field_data ) || ! isset( $field_data['value'] ) || ! is_scalar( $field_data['value'] ) ) {
+                continue;
+            }
+
+            $type = $field_data['type'] ?? '';
+            if ( 'quantity' === $type || ( ! $include_all && 'dimension' !== $type ) ) {
+                continue;
+            }
+
+            $value = trim( wp_strip_all_tags( (string) $field_data['value'] ) );
+            if ( '' !== $value ) {
+                $parts[] = $value;
+            }
+        }
+
+        return implode( $include_all ? ', ' : ' x ', $parts );
     }
 
     /**
